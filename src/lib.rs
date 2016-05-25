@@ -1,7 +1,13 @@
 use std::net::SocketAddr;
 use std::error::Error;
 use std::thread;
+use std::thread::sleep;
+use std::time::Duration;
 use std::collections::HashSet;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt;
+use std::str::from_utf8;
 
 extern crate mio;
 use mio::udp::UdpSocket;
@@ -14,6 +20,19 @@ pub enum Event {
     Connect(SocketAddr),
     Disconnect(SocketAddr),
     Receive(SocketAddr, Vec<u8>),
+}
+
+impl Display for Event {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
+        match *self {
+            Event::Connect(addr) => write!(f, "{} connected.", addr),
+            Event::Disconnect(addr) => write!(f, "{} disconnected.", addr),
+            Event::Receive(addr, ref data) => {
+                let s = from_utf8(data).unwrap_or_else(|e| "Error(Invalid UTF8 received)");
+                write!(f, "{} sent us \"{}\"", addr, s)
+            },
+        }
+    }
 }
 
 #[derive(PartialEq, Copy, Clone)]
@@ -99,9 +118,21 @@ impl Host {
 #[test]
 fn it_works() {
     thread::spawn(|| {
-        do_server();
+        let mut host = Host::new("127.0.0.1:10101".parse().unwrap()).unwrap();
+        loop {
+            for event in host.service().unwrap() {
+                println!("Server: {}", event);
+            }
+            sleep(Duration::new(0, 1000));
+        }
     });
     thread::spawn(|| {
-        do_client();
+        let addr = "127.0.0.1:10102".parse().unwrap();
+        let socket = UdpSocket::bound(&addr).unwrap();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(MESSAGE_PREFIX.as_bytes());
+        payload.push(MessageType::Connect as u8);
+        socket.send_to(&payload, &addr);
     }).join();
 }
