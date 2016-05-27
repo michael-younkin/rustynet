@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::net::UdpSocket;
 use std::error::Error;
 use std::thread;
 use std::thread::sleep;
@@ -8,9 +9,7 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fmt;
 use std::str::from_utf8;
-
-extern crate mio;
-use mio::udp::UdpSocket;
+use std::io;
 
 const MAX_PACKET_SIZE: usize = 64000;
 const MESSAGE_PREFIX: &'static str = "RNETMSG";
@@ -64,7 +63,11 @@ impl Host {
     fn new(addr: SocketAddr) -> Result<Host, Box<Error>> {
         Ok(Host {
             addr: addr,
-            socket: try!(UdpSocket::bound(&addr)),
+            socket: {
+                let socket = try!(UdpSocket::bind(addr));
+                socket.set_nonblocking(true);
+                socket
+            },
             clients: HashSet::new(),
         })
     }
@@ -73,8 +76,12 @@ impl Host {
         let mut events = Vec::new();
         let mut buf = Vec::with_capacity(MAX_PACKET_SIZE);
 
-        // TODO handle truncation errors (possibly with a panic)
-        while let Some((data_len, src)) = try!(self.socket.recv_from(&mut buf)) {
+        loop {
+            let (data_len, src) = match self.socket.recv_from(&mut buf) {
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                e @ Err(_) => try!(e),
+                Ok(v) => v,
+            };
             let prefix = &buf[0..MESSAGE_PREFIX.len()];
             // Ignore anything that doesn't start with our prefix
             if prefix != MESSAGE_PREFIX.as_bytes() {
@@ -109,7 +116,7 @@ impl Host {
                 },
                 _ => ()
             }
-        }
+        };
 
         Ok(events)
     }
@@ -127,8 +134,8 @@ fn it_works() {
         }
     });
     thread::spawn(|| {
-        let addr = "127.0.0.1:10102".parse().unwrap();
-        let socket = UdpSocket::bound(&addr).unwrap();
+        let addr = "127.0.0.1:10102".parse::<SocketAddr>().unwrap();
+        let socket = UdpSocket::bind(addr).unwrap();
 
         let mut payload = Vec::new();
         payload.extend_from_slice(MESSAGE_PREFIX.as_bytes());

@@ -4,4 +4,3 @@ version = "0.1.0"
 authors = ["michael"]
 
 [dependencies]
-mio = "0.5"
