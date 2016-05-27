@@ -10,9 +10,14 @@ use std::fmt::Formatter;
 use std::fmt;
 use std::str::from_utf8;
 use std::io;
+use std::io::Cursor;
+use std::io::Read;
+
+extern crate byteorder;
+use byteorder::{ReadBytesExt, WriteBytesExt, NetworkEndian};
 
 const MAX_PACKET_SIZE: usize = 64000;
-const MESSAGE_PREFIX: &'static str = "RNETMSG";
+static MESSAGE_PREFIX: &'static str = "RNETMSG";
 
 #[derive(PartialEq, Clone)]
 pub enum Event {
@@ -77,20 +82,25 @@ impl Host {
         let mut buf = Vec::with_capacity(MAX_PACKET_SIZE);
 
         loop {
+            buf.clear();
             let (data_len, src) = match self.socket.recv_from(&mut buf) {
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => continue,
                 e @ Err(_) => try!(e),
                 Ok(v) => v,
             };
-            let prefix = &buf[0..MESSAGE_PREFIX.len()];
-            // Ignore anything that doesn't start with our prefix
-            if prefix != MESSAGE_PREFIX.as_bytes() {
+            let mut packet = Cursor::new(&buf[0..data_len]);
+            
+            // Check for the proper prefix
+            // TODO use an array instead of a Vec somehow
+            let mut prefix = Vec::with_capacity(MESSAGE_PREFIX.as_bytes().len());
+            try!(packet.read_exact(&mut prefix));
+            if &prefix != &MESSAGE_PREFIX.as_bytes() {
                 continue;
             }
 
-            let message_type = buf[MESSAGE_PREFIX.len()];
-            let message_payload = &buf[MESSAGE_PREFIX.len() + 1..data_len];
-            match From::from(message_type) {
+            // Read the message type
+            let message_type = From::from(try!(packet.read_u8()));
+            match message_type {
                 MessageType::Connect => {
                     if self.clients.contains(&src) {
                         events.push(Event::Disconnect(src));
@@ -111,7 +121,9 @@ impl Host {
                 },
                 MessageType::Receive => {
                     if self.clients.contains(&src) {
-                        events.push(Event::Receive(src, From::from(message_payload)));
+                        let mut data = Vec::new();
+                        try!(packet.read_to_end(&mut data));
+                        events.push(Event::Receive(src, data));
                     }
                 },
                 _ => ()
