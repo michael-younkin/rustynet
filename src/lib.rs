@@ -89,7 +89,7 @@ impl Host {
                 Ok(v) => v,
             };
             let mut packet = Cursor::new(&buf[0..data_len]);
-            
+
             // Check for the proper prefix
             // TODO use an array instead of a Vec somehow
             let mut prefix = Vec::with_capacity(MESSAGE_PREFIX.as_bytes().len());
