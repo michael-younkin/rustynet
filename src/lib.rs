@@ -41,34 +41,47 @@ enum ChannelReliability {
     Unreliable,
 }
 
-struct Server {
+struct Host {
     socket: UdpSocket,
     channels: Box<[ChannelReliability]>,
 }
 
-impl Server {
-    fn new<A: ToSocketAddrs>(addr: A, channels: &[ChannelReliability]) -> Result<Server> {
+impl Host {
+    fn new<A: ToSocketAddrs>(addr: A, channels: &[ChannelReliability]) -> Result<Host> {
         if channels.len() == 0 {
             panic!("No channels provided.");
         }
         let socket = try!(UdpSocket::bind(addr).map_err(Error::UnableToBindSocket));
-        Ok(Server {
+        Ok(Host {
             socket: socket,
             channels: channels.to_vec().into_boxed_slice(),
         })
     }
+
+    fn to_server(self) -> Server {
+        Server {
+            host: self,
+        }
+    }
+}
+
+struct Server {
+    host: Host,
+}
+
+impl Server {
 }
 
 #[test]
 #[should_panic]
 fn panics_on_0_channels() {
-    Server::new("localhost:10100", &[]);
+    Host::new("localhost:10100", &[]);
 }
 
 #[test]
 fn accepts_at_least_1_channel() {
-    Server::new("localhost:10101", &[ChannelReliability::Unreliable]);
-    Server::new(
+    Host::new("localhost:10101", &[ChannelReliability::Unreliable]);
+    Host::new(
         "localhost:10102",
         &[ChannelReliability::Unreliable, ChannelReliability::Unreliable]
     );
