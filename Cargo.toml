@@ -5,3 +5,4 @@ authors = ["michael"]
 
 [dependencies]
 byteorder = "0.5"
+lazy_static = "0.1.*"
