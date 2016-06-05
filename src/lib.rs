@@ -1,171 +1,109 @@
-use std::net::{ToSocketAddrs, SocketAddr, UdpSocket};
-use std::time::{Instant, UNIX_EPOCH, Duration};
-use std::collections::HashMap;
-use std::io::{Cursor, Read};
-use std::mem::{size_of, transmute};
-use std::iter::repeat;
-use std::cmp::min;
+use std::net::{SocketAddr, UdpSocket};
+use std::mem;
 
-extern crate byteorder;
-use byteorder::{ReadBytesExt, WriteBytesExt, NetworkEndian};
-
-#[macro_use]
-extern crate lazy_static;
-
-const MAX_PACKET_SIZE: usize = 64000;
-static MESSAGE_PREFIX: &'static str = "RNETMSG";
-
-lazy_static! {
-    static ref PROGRAM_START: Instant = Instant::now();
-    static ref HEARTBEAT_TIMEOUT: Duration = Duration::new(5, 0);
-    static ref HEARTBEAT_INTERVAL: Duration = Duration::new(0, 500000);
-}
-
-#[derive(Debug)]
-enum Error {
-    UnableToBindSocket(std::io::Error),
-    UnableToSetNonblocking(std::io::Error),
-    UnableToParsePacket,
-    UnableToReadFromSocket(std::io::Error),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
-        match std::error::Error::cause(self) {
-            Some(cause) => write!(f, "{}({})", std::error::Error::description(self), cause),
-            None => write!(f, "{}", std::error::Error::description(self)),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn description(&self) -> &str {
-        match *self {
-            Error::UnableToBindSocket(_) => "Unable to bind socket",
-            Error::UnableToSetNonblocking(_) => "Unable to make socket nonblocking",
-            Error::UnableToParsePacket => "Unable to parse packet",
-            Error::UnableToReadFromSocket(_) => "Unable to read from socket",
-        }
-    }
-
-    fn cause(&self) -> Option<&std::error::Error> {
-        match *self {
-            Error::UnableToBindSocket(ref e) => Some(e),
-            Error::UnableToSetNonblocking(ref e) => Some(e),
-            Error::UnableToReadFromSocket(ref e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-type Result<T> = std::result::Result<T, Error>;
+/// Appears at the beginning of every valid packet.
+pub const MAGIC_STRING: [u8; 8] = *b"RUSTYNET";
+/// Determines the size of buffers used for receiving packets. The MTU for Ethernet is 1500 so this
+/// should be pretty safe.
+pub const MAX_PACKET_SIZE: usize = 1500;
 
 #[derive(Clone, Debug)]
-enum ChannelReliability {
+/// Represents the reliability of a channel.
+pub enum ChannelReliability {
+    /// An unreliable channel. Messages may or may not be received, newer messages will never be
+    /// received before older ones.
     Unreliable,
 }
 
-struct Host {
-    socket: UdpSocket,
-    channels: Box<[ChannelReliability]>,
-}
-
-impl Host {
-    fn new<A: ToSocketAddrs>(addr: A, channels: &[ChannelReliability]) -> Result<Host> {
-        if channels.len() == 0 {
-            panic!("No channels provided.");
-        } else if channels.len() > std::u8::MAX as usize {
-            panic!("Too many channels provided.");
-        }
-        let socket = try!(UdpSocket::bind(addr).map_err(Error::UnableToBindSocket));
-        try!(socket.set_nonblocking(true).map_err(Error::UnableToSetNonblocking));
-        Ok(Host {
-            socket: socket,
-            channels: channels.to_vec().into_boxed_slice(),
-        })
-    }
-
-    fn to_server(self) -> Server {
-        Server {
-            host: self,
-            clients: HashMap::new(),
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-enum ConnectionState {
-    Disconnected,
-    Connected,
-    Connecting,
-}
-
-#[derive(Copy, Clone, Debug)]
-struct ClientData {
-    addr: SocketAddr,
-    last_recv_time: Instant,
-    last_send_time: Instant,
-    status: ConnectionState,
-}
-
-impl ClientData {
-    fn new(addr: SocketAddr) -> ClientData {
-        ClientData {
-            addr: addr,
-            last_recv_time: *PROGRAM_START,
-            last_send_time: *PROGRAM_START,
-            status: ConnectionState::Connecting,
-        }
-    }
-}
-
-struct NoCopyCursor<'d> {
-    data: &'d [u8],
-    pos: usize,
-}
-
-impl<'d> NoCopyCursor<'d> {
-    fn new(data: &'d [u8]) -> NoCopyCursor {
-        NoCopyCursor {
-            data: data,
-            pos: 0,
-        }
-    }
-
-    fn read_as_slice(&mut self, amt: usize) -> std::io::Result<&'d [u8]> {
-        if self.data.len() == 0 || self.data.len() - self.pos < amt {
-            Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof, "Not enough bytes remaining."))
-        } else {
-            let out = &self.data[self.pos..self.pos + amt];
-            self.pos += amt;
-            Ok(out)
-        }
-    }
-}
-
-impl<'d> Read for NoCopyCursor<'d> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let amt = min(buf.len(), self.data.len() - self.pos);
-        (buf[0..amt]).clone_from_slice(&self.data[0..amt]);
-        Ok(amt)
-    }
-}
-
-enum MessageParseError {
-    Io(std::io::Error),
-    InvalidPrefix,
+pub enum PacketParsingError {
+    TooFewBytes,
+    InvalidMagicString,
     InvalidMessageType,
 }
 
-impl From<std::io::Error> for MessageParseError {
-    fn from(e: std::io::Error) -> MessageParseError {
-        MessageParseError::Io(e)
+#[repr(C)]
+/// Represents the sized components of a packet. Any multibyte components will have network
+/// endianness. This struct is meant to be used inside a Packet.
+pub struct PacketSized {
+    magic_string: [u8; 8],
+    message_type: u8,
+    channel: u8,
+    sequence_num: u32,
+}
+
+impl PacketSized {
+    fn new(message_type: MessageType, channel: u8, sequence_num: u32) -> PacketSized {
+        PacketSized {
+            magic_string: MAGIC_STRING,
+            message_type: message_type.into_u8(),
+            channel: channel,
+            sequence_num: sequence_num,
+        }
+    }
+
+    fn to_bytes(&self) -> &[u8] {
+        let sized_ptr = self as *const PacketSized;
+        let bytes_ptr = sized_ptr as *const u8;
+        unsafe { std::slice::from_raw_parts(bytes_ptr, mem::size_of::<PacketSized>()) }
+    }
+}
+
+#[repr(C)]
+/// Represents a packet. This is an unsized type because the payload portion (application data)
+/// could be any length (including 0).
+pub struct Packet {
+    sized: PacketSized,
+    payload: [u8]
+}
+
+impl Packet {
+    /// Reinterprets a byte slice as a packet. Errors if there are not enough bytes for the sized
+    /// portion of the packet.
+    fn from_bytes(bytes: &[u8]) -> Result<&Packet, PacketParsingError> {
+        if bytes.len() < mem::size_of::<PacketSized>() {
+            return Err(PacketParsingError::TooFewBytes)
+        }
+        let bytes_ptr = bytes as *const [u8];
+        let packet_ptr = bytes_ptr as *const Packet;
+        let packet = unsafe { &*packet_ptr };
+        if packet.sized.magic_string != MAGIC_STRING {
+            return Err(PacketParsingError::InvalidMagicString)
+        }
+        if let Err(_) = MessageType::from_u8(packet.sized.message_type) {
+            return Err(PacketParsingError::InvalidMessageType)
+        }
+        Ok(packet)
+    }
+
+    /// Gets the message type of the packet.
+    ///
+    /// Note: this can panic if somehow the message_type was changed between the packet's
+    /// construction and this method being called. In other words, the invariant is checked during
+    /// construction, not in this method.
+    fn message_type(&self) -> MessageType {
+        MessageType::from_u8(self.sized.message_type).unwrap()
+    }
+
+    /// Gets the channel ID of the packet.
+    fn channel(&self) -> u8 {
+        self.sized.channel
+    }
+
+    /// Gets the sequence number of the packet.
+    fn sequence_num(&self) -> u32 {
+        // TODO endianness conversion
+        self.sized.sequence_num
+    }
+
+    /// Gets the payload of the packet. This may be any length (though one would expect it to be
+    /// less than 1500 bytes).
+    fn payload(&self) -> &[u8] {
+        &self.payload
     }
 }
 
 #[derive(Copy, Clone, Debug)]
-enum MessageType {
+pub enum MessageType {
     Heartbeat,
     UnreliablePayload,
 }
@@ -187,134 +125,115 @@ impl MessageType {
     }
 }
 
-enum Message<'p> {
-    Heartbeat,
-    UnreliablePayload {
-        sequence_i: u64,
-        data: &'p [u8],
-    },
+/// Represents a thing that acts like a networking socket. Arguably this should be provided by the
+/// standard library (but it isn't for now). This is necessary to let us mock socket's in unit
+/// tests.
+pub trait Socket {
+    fn recv(&self, &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+    fn send(&self, &[u8], addr: SocketAddr) -> std::io::Result<usize>;
 }
 
-impl<'p> Message<'p> {
-    fn parse(data: &'p [u8]) -> std::result::Result<Message<'p>, MessageParseError> {
-        let mut reader = NoCopyCursor::new(data);
+/// UdpSocket's are also Socket's. Methods are declared as inline to avoid any overhead from the
+/// indirection.
+impl Socket for UdpSocket {
+    #[inline]
+    fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.recv_from(buf)
+    }
 
-        // Check the prefix
-        let prefix = match reader.read_as_slice(MESSAGE_PREFIX.as_bytes().len()) {
-            Ok(p) => p,
-            Err(_) => return Err(MessageParseError::InvalidPrefix),
-        };
-        if prefix != MESSAGE_PREFIX.as_bytes() {
-            return Err(MessageParseError::InvalidPrefix)
-        }
-
-        // Read the message type
-        // TODO figure out if there's a nicer way to write this
-        let message_type_v = try!(reader.read_u8()
-                                  .map_err(|_| MessageParseError::InvalidMessageType));
-        let message_type = try!(MessageType::from_u8(message_type_v)
-                                .map_err(|_| MessageParseError::InvalidMessageType));
-
-        match message_type {
-            MessageType::Heartbeat => Ok(Message::Heartbeat),
-            _ => Err(MessageParseError::InvalidMessageType),
-        }
+    #[inline]
+    fn send(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<(usize)> {
+        self.send_to(buf, addr)
     }
 }
 
-#[derive(Clone, Debug)]
-enum EventType {
-    Heartbeat,
+/// A RustyNet server.
+pub struct Server<S: Socket> {
+    socket: S,
 }
 
-#[derive(Clone, Debug)]
-struct Event {
-    client: ClientData,
-    variant: EventType,
-}
+impl<S: Socket> Server<S> {
+    /// Constructs a new Server instance using an already constructed Socket. This is helpful for
+    /// unit testing.
+    fn new(socket: S) -> Server<S> {
+        Server {
+            socket: socket,
+        }
+    }
 
-struct Server {
-    host: Host,
-    clients: HashMap<SocketAddr, ClientData>,
-}
+    fn service(&self) -> Vec<SocketAddr> {
+        let mut sources = Vec::new();
 
-impl Server {
-    fn service(&mut self) -> Vec<Event> {
-        let mut events = Vec::new();
-
-        // Read incoming packets
-        loop {
-            let mut buf = Vec::new();
-            buf.resize(MAX_PACKET_SIZE, 0);
-
-            // TODO handle the case where the socket is messed up separate from the case where
-            // there are no messages
-            let (len, addr) = match self.host.socket.recv_from(&mut buf) {
-                Ok(v) => v,
-                Err(v) => break,
-            };
-            buf.resize(len, 0);
-
-            // Try to parse the payload
-            let message = match Message::parse(&buf) {
-                Ok(v) => v,
-                // TODO log errors (not super important, but they might be corrupted packets - it'd
-                // probably be useful to know for debugging though
-                Err(_) => break,
-            };
-
-            // Get the client data (or create if necessary)
-            let mut client_data = self.clients.entry(addr).or_insert_with(|| ClientData::new(addr));
-            client_data.last_recv_time = Instant::now();
-
-            // Produce an appropriate event type
-            events.push(Event { client: *client_data, variant: EventType::Heartbeat });
+        let mut buf = [0; MAX_PACKET_SIZE];
+        while let Ok((_, src)) = self.socket.recv(&mut buf) {
+            sources.push(src);
         }
 
-        let now = Instant::now();
+        sources
+    }
+}
 
-        // Remove dead clients
-        let dead_clients: Vec<_> = self.clients.values()
-            .filter(|client| now - client.last_recv_time < *HEARTBEAT_TIMEOUT)
-            .map(|client| client.clone())
-            .collect();
-        for client in dead_clients {
-            self.clients.remove(&client.addr);
-        }
+/// Constructs a Server using a UdpSocket. This is what most people should use to make a server.
+pub fn bind_server(addr: SocketAddr) -> Result<Server<UdpSocket>, Box<std::error::Error>> {
+    let socket = try!(UdpSocket::bind(addr));
+    try!(socket.set_nonblocking(true));
+    Ok(Server::new(socket))
+}
 
-        // Send a heartbeat message to any quiet clients
-        for (addr, client) in self.clients.iter_mut() {
-            if now - client.last_send_time >= *HEARTBEAT_INTERVAL {
-                client.last_send_time = now;
-                // TODO send heartbeat message
+#[cfg(test)]
+mod tests {
+
+    use std;
+    use std::net::SocketAddr;
+    use std::cell::Cell;
+
+    use super::*;
+
+    struct MockSock<'m> {
+        messages: &'m [(SocketAddr, &'m [u8])],
+        i: Cell<usize>,
+    }
+
+    impl<'m> MockSock<'m> {
+        fn new(messages: &'m [(SocketAddr, &'m [u8])]) -> MockSock {
+            MockSock {
+                messages: messages,
+                i: Cell::new(0),
             }
         }
-
-        events
     }
-}
 
-// TODO add the correct should_panic text
-#[test]
-#[should_panic]
-fn panics_on_0_channels() {
-    Host::new("localhost:10100", &[]).unwrap();
-}
+    impl<'m> Socket for MockSock<'m> {
+        fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let i = self.i.get();
+            let (addr, src_buf) = self.messages[i];
+            self.i.set(i + 1);
+            buf.clone_from_slice(src_buf);
+            Ok((src_buf.len(), addr))
+        }
 
-// TODO add the correct should_panic text
-#[test]
-#[should_panic]
-fn panics_on_too_many_channels() {
-    let channels: Vec<ChannelReliability> =
-        repeat(ChannelReliability::Unreliable).take(500).collect();
-    Host::new("localhost:10101", &channels).unwrap();
-}
+        fn send(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<(usize)> {
+            Ok(0)
+        }
+    }
 
-#[test]
-fn accepts_at_least_1_channel() {
-    Host::new("localhost:10101", &[ChannelReliability::Unreliable]).unwrap();
-    Host::new(
-        "localhost:10102",
-        &[ChannelReliability::Unreliable, ChannelReliability::Unreliable]
-    ).unwrap();
+
+    #[test]
+    fn can_setup_nonblocking_socket() {
+        let addr = "localhost:10101".parse::<SocketAddr>();
+        let server = bind_server("127.0.0.1:10101".parse().unwrap());
+    }
+
+    #[test]
+    fn can_read_from_socket() {
+        let addr = "178.32.3.2:12333".parse().unwrap();
+        let message_1 = PacketSized::new(MessageType::Heartbeat, 0, 0);
+        let message_2 = PacketSized::new(MessageType::Heartbeat, 123, 123);
+        let messages = &[(addr, message_1.to_bytes()), (addr, message_2.to_bytes())];
+        let mock_sock = MockSock::new(messages);
+        let server = Server::new(mock_sock);
+        let events = server.service();
+        assert_eq!(events[0], addr);
+        assert_eq!(events[1], addr);
+    }
 }
