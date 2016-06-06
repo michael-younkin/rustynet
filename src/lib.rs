@@ -186,6 +186,7 @@ mod tests {
     use std;
     use std::net::SocketAddr;
     use std::cell::Cell;
+    use std::cmp;
 
     use super::*;
 
@@ -206,9 +207,14 @@ mod tests {
     impl<'m> Socket for MockSock<'m> {
         fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
             let i = self.i.get();
+            if i == self.messages.len() {
+                return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock, "No more packets to read."))
+            }
             let (addr, src_buf) = self.messages[i];
             self.i.set(i + 1);
-            buf.clone_from_slice(src_buf);
+            let amt_read = cmp::min(buf.len(), src_buf.len());
+            buf[0..amt_read].clone_from_slice(&src_buf[0..amt_read]);
             Ok((src_buf.len(), addr))
         }
 
@@ -216,7 +222,6 @@ mod tests {
             Ok(0)
         }
     }
-
 
     #[test]
     fn can_setup_nonblocking_socket() {
