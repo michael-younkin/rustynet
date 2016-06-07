@@ -148,15 +148,15 @@ impl Socket for UdpSocket {
 }
 
 /// A RustyNet server.
-pub struct Server<S: Socket> {
+pub struct Host<S: Socket> {
     socket: S,
 }
 
-impl<S: Socket> Server<S> {
-    /// Constructs a new Server instance using an already constructed Socket. This is helpful for
+impl<S: Socket> Host<S> {
+    /// Constructs a new Host instance using an already constructed Socket. This is helpful for
     /// unit testing.
-    fn new(socket: S) -> Server<S> {
-        Server {
+    fn new(socket: S) -> Host<S> {
+        Host {
             socket: socket,
         }
     }
@@ -173,12 +173,12 @@ impl<S: Socket> Server<S> {
     }
 }
 
-/// Constructs a Server using a UdpSocket. This is what most people should use to make a server.
+/// Constructs a Host using a UdpSocket. This is what most people should use to make a server.
 /// Uses the first valid SocketAddr produced by the ToSocketAddrs object.
-pub fn bind_server<A: ToSocketAddrs>(addr: A) -> Result<Server<UdpSocket>, Box<std::error::Error>> {
+pub fn bind_server<A: ToSocketAddrs>(addr: A) -> Result<Host<UdpSocket>, Box<std::error::Error>> {
     let socket = try!(UdpSocket::bind(addr));
     try!(socket.set_nonblocking(true));
-    Ok(Server::new(socket))
+    Ok(Host::new(socket))
 }
 
 #[cfg(test)]
@@ -236,7 +236,7 @@ mod tests {
         let message_2 = PacketSized::new(MessageType::Heartbeat, 123, 123);
         let messages = &[(addr, message_1.to_bytes()), (addr, message_2.to_bytes())];
         let mock_sock = MockSock::new(messages);
-        let server = Server::new(mock_sock);
+        let server = Host::new(mock_sock);
         let events = server.service();
         assert_eq!(events[0], addr);
         assert_eq!(events[1], addr);
