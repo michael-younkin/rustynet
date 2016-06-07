@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, UdpSocket, ToSocketAddrs};
 use std::mem;
 
 /// Appears at the beginning of every valid packet.
@@ -174,7 +174,8 @@ impl<S: Socket> Server<S> {
 }
 
 /// Constructs a Server using a UdpSocket. This is what most people should use to make a server.
-pub fn bind_server(addr: SocketAddr) -> Result<Server<UdpSocket>, Box<std::error::Error>> {
+/// Uses the first valid SocketAddr produced by the ToSocketAddrs object.
+pub fn bind_server<A: ToSocketAddrs>(addr: A) -> Result<Server<UdpSocket>, Box<std::error::Error>> {
     let socket = try!(UdpSocket::bind(addr));
     try!(socket.set_nonblocking(true));
     Ok(Server::new(socket))
@@ -225,8 +226,7 @@ mod tests {
 
     #[test]
     fn can_setup_nonblocking_socket() {
-        let addr = "localhost:10101".parse::<SocketAddr>();
-        let server = bind_server("127.0.0.1:10101".parse().unwrap());
+        let server = bind_server("127.0.0.1:10101");
     }
 
     #[test]
