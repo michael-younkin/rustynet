@@ -7,14 +7,6 @@ pub const MAGIC_STRING: [u8; 8] = *b"RUSTYNET";
 /// should be pretty safe.
 pub const MAX_PACKET_SIZE: usize = 1500;
 
-#[derive(Clone, Debug)]
-/// Represents the reliability of a channel.
-pub enum ChannelReliability {
-    /// An unreliable channel. Messages may or may not be received, newer messages will never be
-    /// received before older ones.
-    Unreliable,
-}
-
 pub enum PacketParsingError {
     TooFewBytes,
     InvalidMagicString,
@@ -27,16 +19,14 @@ pub enum PacketParsingError {
 pub struct PacketSized {
     magic_string: [u8; 8],
     message_type: u8,
-    channel: u8,
     sequence_num: u32,
 }
 
 impl PacketSized {
-    fn new(message_type: MessageType, channel: u8, sequence_num: u32) -> PacketSized {
+    fn new(message_type: MessageType, sequence_num: u32) -> PacketSized {
         PacketSized {
             magic_string: MAGIC_STRING,
             message_type: message_type.into_u8(),
-            channel: channel,
             sequence_num: sequence_num,
         }
     }
@@ -82,11 +72,6 @@ impl Packet {
     /// construction, not in this method.
     fn message_type(&self) -> MessageType {
         MessageType::from_u8(self.sized.message_type).unwrap()
-    }
-
-    /// Gets the channel ID of the packet.
-    fn channel(&self) -> u8 {
-        self.sized.channel
     }
 
     /// Gets the sequence number of the packet.
@@ -232,8 +217,8 @@ mod tests {
     #[test]
     fn can_read_from_socket() {
         let addr = "178.32.3.2:12333".parse().unwrap();
-        let message_1 = PacketSized::new(MessageType::Heartbeat, 0, 0);
-        let message_2 = PacketSized::new(MessageType::Heartbeat, 123, 123);
+        let message_1 = PacketSized::new(MessageType::Heartbeat, 0);
+        let message_2 = PacketSized::new(MessageType::Heartbeat, 123);
         let messages = &[(addr, message_1.to_bytes()), (addr, message_2.to_bytes())];
         let mock_sock = MockSock::new(messages);
         let server = Host::new(mock_sock);
