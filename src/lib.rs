@@ -7,6 +7,27 @@ pub const MAGIC_STRING: [u8; 8] = *b"RUSTYNET";
 /// should be pretty safe.
 pub const MAX_PACKET_SIZE: usize = 1500;
 
+#[repr(C)]
+struct PacketMetadata {
+}
+
+struct PacketBuffer {
+    buf: [u8; MAX_PACKET_SIZE],
+    len: usize,
+}
+
+impl PacketBuffer {
+    fn recv<S: Socket>(socket: S) -> std::io::Result<PacketBuffer> {
+        let mut buffer = Box::new(PacketBuffer {
+            buf: [0; MAX_PACKET_SIZE],
+            len: 0,
+        });
+        let (amt, src) = try!(socket.recv_from(&mut buffer.buf));
+        buffer.len = amt;
+        buffer
+    }
+}
+
 pub enum PacketParsingError {
     TooFewBytes,
     InvalidMagicString,
