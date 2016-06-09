@@ -9,6 +9,7 @@ pub const MAX_PACKET_SIZE: usize = 1500;
 
 #[repr(C)]
 struct PacketMetadata {
+    dummy: u32,
 }
 
 struct PacketBuffer {
@@ -17,14 +18,53 @@ struct PacketBuffer {
 }
 
 impl PacketBuffer {
-    fn recv<S: Socket>(socket: S) -> std::io::Result<PacketBuffer> {
+    /// Gets the minimum number of bytes needed to store a valid packet (equal to the size of the
+    /// PacketMetadata struct plus the size of the MAGIC_STRING".
+    ///
+    /// TODO CONST_FN make this const fn when that becomes stable.
+    fn min_packet_length() -> usize {
+        mem::size_of::<PacketMetadata>() + MAX_PACKET_SIZE.len()
+    }
+
+    /// Tries to recv a packet from the socket.
+    ///
+    /// TODO BUFFER_POOL use a buffer pool to avoid excessive heap allocation.
+    fn recv<S: Socket>(socket: S) -> std::io::Result<Box<PacketBuffer>> {
         let mut buffer = Box::new(PacketBuffer {
             buf: [0; MAX_PACKET_SIZE],
             len: 0,
         });
         let (amt, src) = try!(socket.recv_from(&mut buffer.buf));
+
+        // We check these here so users never end up with a partially valid packet.
+        if amt < PacketBuffer::min_packet_length() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Packet was too short."))
+        } else if (self.metadata().buf != MAGIC_STRING) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Incorrect magic string."))
+        }
+
         buffer.len = amt;
         buffer
+    }
+
+    /// Gets the packet metadata stored in this buffer.
+    ///
+    /// This works by reinterpreting the buffer as a PacketMetadata.
+    fn metadata(&self) -> &PacketMetadata {
+        unsafe {
+            let bytes_ptr = &self.buffer as *const u8;
+            let metadata_ptr = bytes.ptr.offset(MAX_PACKET_SIZE.len()) as *const PacketMetadata;
+            &*metadata_ptr
+        }
+    }
+
+    /// Get the data portion of the buffer (AKA the part provided by the user).
+    fn data(&self) -> &[u8] {
+        unsafe {
+            let bytes_ptr = &self.buffer as *const u8;
+            let data_ptr = bytes.ptr.offset(PacketBuffer::min_packet_length()) as *const u8;
+            std::slice::from_raw_parts(data_ptr, self.len - PacketBuffer::min_packet_length())
+        }
     }
 }
 
