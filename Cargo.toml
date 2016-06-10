@@ -4,5 +4,4 @@ version = "0.1.0"
 authors = ["michael"]
 
 [dependencies]
-byteorder = "0.5"
-lazy_static = "0.1.*"
+quick-error = "1.1.0"

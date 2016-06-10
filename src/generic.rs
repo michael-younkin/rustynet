@@ -9,7 +9,7 @@ pub trait Socket {
     fn send_to(&self, &[u8], addr: SocketAddr) -> io::Result<usize>;
 }
 
-/// UdpSocket's are also Socket's. Methods are declared as inline to avoid any overhead from the
+/// UdpSockets are also Sockets. Methods are declared as inline to avoid any overhead from the
 /// indirection.
 impl Socket for UdpSocket {
     #[inline]
