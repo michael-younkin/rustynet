@@ -1,6 +1,10 @@
+use std::net::SocketAddr;
 use std::mem;
 use std::slice;
 use std::io;
+use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::ops::{Deref, DerefMut};
 
 use generic::*;
 
@@ -11,14 +15,119 @@ pub const MAGIC_STRING: [u8; 8] = *b"RUSTYNET";
 /// should be pretty safe.
 pub const MAX_PACKET_SIZE: usize = 1500;
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum MessageType {
+    Connect,
+}
+
+impl MessageType {
+    fn into_u8(self) -> u8 {
+        match self {
+            MessageType::Connect => 0,
+        }
+    }
+
+    fn from_u8(v: u8) -> Result<MessageType, ()> {
+        match v {
+            0 => Ok(MessageType::Connect),
+            _ => Err(()),
+        }
+    }
+}
+
+quick_error! {
+    #[derive(Debug)]
+    pub enum PacketError {
+        Io(err: io::Error) {
+            from()
+        }
+        NotEnoughData {}
+    }
+}
+
+pub struct PacketBufferPool {
+    pool: RefCell<VecDeque<Box<PacketBuffer>>>,
+}
+
+impl PacketBufferPool {
+    fn new() -> PacketBufferPool {
+        PacketBufferPool { pool: RefCell::new(VecDeque::new()) }
+    }
+
+    fn len(&self) -> usize {
+        self.pool.borrow().len()
+    }
+
+    fn get_buf(&self) -> PacketBufferHandle {
+        let mut mut_pool = self.pool.borrow_mut();
+        let buf = match mut_pool.pop_front() {
+            Some(buf) => buf,
+            None => Box::new(PacketBuffer::new()),
+        };
+        PacketBufferHandle::new(buf, self)
+    }
+
+    fn return_buf(&self, buf: Box<PacketBuffer>) {
+        let mut mut_pool = self.pool.borrow_mut();
+        mut_pool.push_front(buf);
+    }
+}
+
+pub struct PacketBufferHandle<'p> {
+    pool: &'p PacketBufferPool,
+    buf: *mut PacketBuffer,
+}
+
+impl<'p> PacketBufferHandle<'p> {
+    fn new(buf: Box<PacketBuffer>, pool: &'p PacketBufferPool) -> PacketBufferHandle {
+        let ptr = Box::into_raw(buf);
+        PacketBufferHandle {
+            pool: pool,
+            buf: ptr,
+        }
+    }
+}
+
+impl<'p> Deref for PacketBufferHandle<'p> {
+    type Target = PacketBuffer;
+
+    fn deref(&self) -> &PacketBuffer {
+        unsafe { &*self.buf }
+    }
+}
+
+impl<'p> DerefMut for PacketBufferHandle<'p> {
+    fn deref_mut(&mut self) -> &mut PacketBuffer {
+        unsafe { &mut *self.buf }
+    }
+}
+
+impl<'p> Drop for PacketBufferHandle<'p> {
+    fn drop(&mut self) {
+        // Clear it now so we don't have to put it in a RefCell inside the pool (because Box is
+        // immutable)
+        unsafe { (&mut *self.buf).clear() };
+
+        // We do this so buf doesn't need to be an option: forcing self.buf to be a pointer means
+        // Rust won't drop it for us.
+        let buf = unsafe { Box::from_raw(self.buf) };
+        self.pool.return_buf(buf);
+    }
+}
+
 /// Stores metadata (some might call this the packet header).
 #[repr(C)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PacketMetadata {
-    dummy: u32,
+    message_type: u8,
 }
 
 impl PacketMetadata {
+    fn validate(self) -> Result<(), &'static str> {
+        try!(MessageType::from_u8(self.message_type).map_err(|_| "Invalid message type."));
+        Ok(())
+    }
+
     fn bytes(&self) -> &[u8] {
         unsafe {
             let metadata_ptr = self as *const PacketMetadata;
@@ -28,88 +137,58 @@ impl PacketMetadata {
     }
 }
 
-/// Stores all of the data associated with a packet.
-///
-/// Note that this struct is supposed to be designed such that it will always be "safe" ie. it will
-/// always be safe to call any functions on this struct.
+/// A buffer for storing and interpreting data associated with a packet. Accessor functions return
+/// errors if there isn't enough data.
 pub struct PacketBuffer {
     buf: [u8; MAX_PACKET_SIZE],
     len: usize,
 }
 
 impl PacketBuffer {
-    /// Constructs a packet using the given metadata and user data.
-    ///
-    /// Panics if too much user data is provided. (Eventually this should be impossible once
-    /// fragmentation is supported. That's why this is a panic and not an error.)
-    pub fn new(metadata: &PacketMetadata, user_data: &[u8]) -> Box<PacketBuffer> {
-        let total_len = PacketBuffer::min_packet_length() + user_data.len();
-        if PacketBuffer::min_packet_length() + user_data.len() > MAX_PACKET_SIZE {
-            panic!("Too much data");
-        }
-        let mut buf = Box::new(PacketBuffer {
-            buf: [0; MAX_PACKET_SIZE],
-            len: PacketBuffer::min_packet_length() + user_data.len(),
-        });
-        buf.buf[0..MAGIC_STRING.len()].clone_from_slice(&MAGIC_STRING);
-        buf.buf[MAGIC_STRING.len()..PacketBuffer::min_packet_length()]
-            .clone_from_slice(metadata.bytes());
-        buf.buf[PacketBuffer::min_packet_length()..total_len].clone_from_slice(user_data);
-        buf
-    }
-
-    /// Tries to recv a packet from the socket.
-    ///
-    /// TODO BUFFER_POOL use a buffer pool to avoid excessive heap allocation.
-    pub fn recv<S: Socket>(socket: S) -> io::Result<Box<PacketBuffer>> {
-        let mut buf = Box::new(PacketBuffer {
+    fn new() -> PacketBuffer {
+        PacketBuffer {
             buf: [0; MAX_PACKET_SIZE],
             len: 0,
-        });
-        let (amt, src) = try!(socket.recv_from(&mut buf.buf));
-
-        // We check these here so users never end up with a partially valid packet.
-        if amt < PacketBuffer::min_packet_length() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Packet was too short."));
-        } else if buf.buf[0..MAGIC_STRING.len()] != MAGIC_STRING {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Incorrect magic string."));
         }
-
-        buf.len = amt;
-        Ok(buf)
     }
 
-    /// Gets the minimum number of bytes needed to store a valid packet (equal to the size of the
-    /// PacketMetadata struct plus the size of the MAGIC_STRING".
+    fn clear(&mut self) {
+        self.buf.clone_from_slice(&[0; MAX_PACKET_SIZE]);
+        self.len = 0;
+    }
+
+    /// Uses this buffer to load data from a socket.
+    pub fn recv_from<S: Socket>(&mut self, socket: S) -> Result<(usize, SocketAddr), PacketError> {
+        let (amt, src) = try!(socket.recv_from(&mut self.buf));
+        self.len = amt;
+        Ok((amt, src))
+    }
+
+    /// Gets the packet metadata stored in this buffer. This works by interpreting the first
+    /// mem::size_of::<PacketMetadata>() bytes as a PacketMetadata struct.
     ///
-    /// TODO CONST_FN make this const fn when that becomes stable.
-    pub fn min_packet_length() -> usize {
-        mem::size_of::<PacketMetadata>() + MAGIC_STRING.len()
-    }
-
-    fn magic_string(&self) -> &[u8] {
-        &self.buf[0..MAGIC_STRING.len()]
-    }
-
-    /// Gets the packet metadata stored in this buffer.
-    ///
-    /// This works by reinterpreting the buffer as a PacketMetadata.
-    pub fn metadata(&self) -> &PacketMetadata {
+    /// The data returned may be invalid (ie. this might not be a valid packet) but it will all be
+    /// actual data recevied from the socket.
+    pub fn metadata(&self) -> Result<&PacketMetadata, PacketError> {
+        if self.len < mem::size_of::<PacketMetadata>() {
+            return Err(PacketError::NotEnoughData);
+        }
         unsafe {
             let bytes_ptr = &self.buf as *const u8;
-            let metadata_ptr =
-                bytes_ptr.offset(MAGIC_STRING.len() as isize) as *const PacketMetadata;
-            &*metadata_ptr
+            let metadata_ptr = bytes_ptr as *const PacketMetadata;
+            Ok(&*metadata_ptr)
         }
     }
 
     /// Get the data portion of the buffer (AKA the part provided by the user).
-    pub fn data(&self) -> &[u8] {
+    pub fn data(&self) -> Result<&[u8], PacketError> {
+        if self.len < mem::size_of::<PacketMetadata>() {
+            return Err(PacketError::NotEnoughData);
+        }
         unsafe {
             let bytes_ptr = &self.buf as *const u8;
-            let data_ptr =
-                bytes_ptr.offset(PacketBuffer::min_packet_length() as isize) as *const u8;
-            slice::from_raw_parts(data_ptr, self.len - PacketBuffer::min_packet_length())
+            let data_ptr = bytes_ptr.offset(mem::size_of::<PacketMetadata>() as isize) as *const u8;
+            Ok(slice::from_raw_parts(data_ptr, self.len - mem::size_of::<PacketMetadata>()))
         }
     }
 }
@@ -119,18 +198,14 @@ mod tests {
     use super::*;
 
     #[test]
-    #[should_panic]
-    fn too_much_data() {
-        PacketBuffer::new(&PacketMetadata { dummy: 0 }, &[0; MAX_PACKET_SIZE]);
-    }
-
-    #[test]
-    fn make_buffer() {
-        let metadata = PacketMetadata { dummy: 0 };
-        let user_data = [0; 10];
-        let buf = PacketBuffer::new(&metadata, &user_data);
-        assert_eq!(buf.magic_string(), MAGIC_STRING);
-        assert_eq!(buf.metadata(), &metadata);
-        assert_eq!(buf.data(), &user_data);
+    fn create_and_return_buffers() {
+        let pool = PacketBufferPool::new();
+        fn test(pool: &PacketBufferPool) {
+            let buf1 = pool.get_buf();
+            let buf2 = pool.get_buf();
+            let buf3 = pool.get_buf();
+        }
+        test(&pool);
+        assert_eq!(pool.len(), 3);
     }
 }
