@@ -8,204 +8,161 @@ use std::ops::{Deref, DerefMut};
 
 use generic::*;
 
-/// Appears at the beginning of every valid packet.
-pub const MAGIC_STRING: [u8; 8] = *b"RUSTYNET";
+type SeqNum = u32;
+
+/// Has to match in the same place in every packet.
+pub const MAGIC_NUMBER: u8 = 8;
 
 /// Determines the size of buffers used for receiving packets. The MTU for Ethernet is 1500 so this
 /// should be pretty safe.
 pub const MAX_PACKET_SIZE: usize = 1500;
 
-#[derive(Copy, Clone, Debug, PartialEq)]
-enum MessageType {
-    Connect,
-}
-
-impl MessageType {
-    fn into_u8(self) -> u8 {
-        match self {
-            MessageType::Connect => 0,
-        }
-    }
-
-    fn from_u8(v: u8) -> Result<MessageType, ()> {
-        match v {
-            0 => Ok(MessageType::Connect),
-            _ => Err(()),
-        }
-    }
-}
-
 quick_error! {
     #[derive(Debug)]
-    pub enum PacketError {
+    pub enum MessageError {
         Io(err: io::Error) {
             from()
         }
+        InvalidHeader {}
         NotEnoughData {}
+        UnknownMessageType {}
     }
 }
 
-pub struct PacketBufferPool {
-    pool: RefCell<VecDeque<Box<PacketBuffer>>>,
+enum Message<'p> {
+    /// Sent at the start of the connection handshake.
+    ConnectStart {
+        src: SocketAddr,
+    },
+    /// Sent in response to handshake start.
+    ConnectConfirm {
+        num_channels: u8,
+        seq_nums: &'p [SeqNum],
+    },
+    /// Sent to confirm complete connection
+    ConnectComplete {
+        num_channels: u8,
+        seq_nums: &'p [SeqNum],
+    },
 }
 
-impl PacketBufferPool {
-    fn new() -> PacketBufferPool {
-        PacketBufferPool { pool: RefCell::new(VecDeque::new()) }
-    }
+impl<'p> Message<'p> {
+    fn from_packet(packet: &'p Packet) -> Result<Message<'p>, MessageError> {
+        let header = try!(packet.header());
 
-    fn len(&self) -> usize {
-        self.pool.borrow().len()
-    }
-
-    fn get_buf(&self) -> PacketBufferHandle {
-        let mut mut_pool = self.pool.borrow_mut();
-        let buf = match mut_pool.pop_front() {
-            Some(buf) => buf,
-            None => Box::new(PacketBuffer::new()),
-        };
-        PacketBufferHandle::new(buf, self)
-    }
-
-    fn return_buf(&self, buf: Box<PacketBuffer>) {
-        let mut mut_pool = self.pool.borrow_mut();
-        mut_pool.push_front(buf);
-    }
-}
-
-pub struct PacketBufferHandle<'p> {
-    pool: &'p PacketBufferPool,
-    buf: *mut PacketBuffer,
-}
-
-impl<'p> PacketBufferHandle<'p> {
-    fn new(buf: Box<PacketBuffer>, pool: &'p PacketBufferPool) -> PacketBufferHandle {
-        let ptr = Box::into_raw(buf);
-        PacketBufferHandle {
-            pool: pool,
-            buf: ptr,
+        // Verify the magic number
+        if header.magic_number != MAGIC_NUMBER {
+            return Err(MessageError::InvalidHeader);
         }
+
+        Ok(match header.message_type {
+            0 => Message::ConnectStart { src: packet.addr() },
+            1 => {
+                let channels = try!(packet.channels());
+                Message::ConnectConfirm {
+                    num_channels: channels.num_channels,
+                    seq_nums: channels.seq_nums,
+                }
+            }
+            2 => {
+                let channels = try!(packet.channels());
+                Message::ConnectComplete {
+                    num_channels: channels.num_channels,
+                    seq_nums: channels.seq_nums,
+                }
+            }
+            _ => return Err(MessageError::UnknownMessageType),
+        })
     }
 }
 
-impl<'p> Deref for PacketBufferHandle<'p> {
-    type Target = PacketBuffer;
+struct Packet {
+    buf: PacketBuffer,
+    addr: SocketAddr,
+}
 
-    fn deref(&self) -> &PacketBuffer {
-        unsafe { &*self.buf }
+impl Packet {
+    fn new<S: Socket>(socket: S) -> Result<Packet, MessageError> {
+        let mut buf = PacketBuffer {
+            buf: [0; MAX_PACKET_SIZE],
+            len: 0,
+        };
+
+        let (amt, addr) = try!(socket.recv_from(&mut buf.buf));
+        buf.len = amt;
+
+        Ok(Packet {
+            buf: buf,
+            addr: addr,
+        })
+    }
+
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn header(&self) -> Result<&PacketHeader, MessageError> {
+        self.buf.metadata()
+    }
+
+    fn channels(&self) -> Result<Channels, MessageError> {
+        self.buf.channels()
     }
 }
 
-impl<'p> DerefMut for PacketBufferHandle<'p> {
-    fn deref_mut(&mut self) -> &mut PacketBuffer {
-        unsafe { &mut *self.buf }
-    }
-}
-
-impl<'p> Drop for PacketBufferHandle<'p> {
-    fn drop(&mut self) {
-        // Clear it now so we don't have to put it in a RefCell inside the pool (because Box is
-        // immutable)
-        unsafe { (&mut *self.buf).clear() };
-
-        // We do this so buf doesn't need to be an option: forcing self.buf to be a pointer means
-        // Rust won't drop it for us.
-        let buf = unsafe { Box::from_raw(self.buf) };
-        self.pool.return_buf(buf);
-    }
-}
-
-/// Stores metadata (some might call this the packet header).
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq)]
-pub struct PacketMetadata {
+struct PacketHeader {
+    seq_num: SeqNum,
+    magic_number: u8,
+    channel: u8,
     message_type: u8,
 }
 
-impl PacketMetadata {
-    fn validate(self) -> Result<(), &'static str> {
-        try!(MessageType::from_u8(self.message_type).map_err(|_| "Invalid message type."));
-        Ok(())
-    }
-
-    fn bytes(&self) -> &[u8] {
-        unsafe {
-            let metadata_ptr = self as *const PacketMetadata;
-            let bytes_ptr = metadata_ptr as *const u8;
-            slice::from_raw_parts(bytes_ptr, mem::size_of::<PacketMetadata>())
-        }
-    }
+struct Channels<'p> {
+    num_channels: u8,
+    seq_nums: &'p [SeqNum],
 }
 
-/// A buffer for storing and interpreting data associated with a packet. Accessor functions return
-/// errors if there isn't enough data.
-pub struct PacketBuffer {
+struct PacketBuffer {
     buf: [u8; MAX_PACKET_SIZE],
     len: usize,
 }
 
 impl PacketBuffer {
-    fn new() -> PacketBuffer {
-        PacketBuffer {
-            buf: [0; MAX_PACKET_SIZE],
-            len: 0,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.buf.clone_from_slice(&[0; MAX_PACKET_SIZE]);
-        self.len = 0;
-    }
-
-    /// Uses this buffer to load data from a socket.
-    pub fn recv_from<S: Socket>(&mut self, socket: S) -> Result<(usize, SocketAddr), PacketError> {
-        let (amt, src) = try!(socket.recv_from(&mut self.buf));
-        self.len = amt;
-        Ok((amt, src))
-    }
-
-    /// Gets the packet metadata stored in this buffer. This works by interpreting the first
-    /// mem::size_of::<PacketMetadata>() bytes as a PacketMetadata struct.
-    ///
-    /// The data returned may be invalid (ie. this might not be a valid packet) but it will all be
-    /// actual data recevied from the socket.
-    pub fn metadata(&self) -> Result<&PacketMetadata, PacketError> {
-        if self.len < mem::size_of::<PacketMetadata>() {
-            return Err(PacketError::NotEnoughData);
+    fn metadata(&self) -> Result<&PacketHeader, MessageError> {
+        if self.len < mem::size_of::<PacketHeader>() {
+            return Err(MessageError::NotEnoughData);
         }
         unsafe {
             let bytes_ptr = &self.buf as *const u8;
-            let metadata_ptr = bytes_ptr as *const PacketMetadata;
+            let metadata_ptr = bytes_ptr as *const PacketHeader;
             Ok(&*metadata_ptr)
         }
     }
 
-    /// Get the data portion of the buffer (AKA the part provided by the user).
-    pub fn data(&self) -> Result<&[u8], PacketError> {
-        if self.len < mem::size_of::<PacketMetadata>() {
-            return Err(PacketError::NotEnoughData);
-        }
-        unsafe {
-            let bytes_ptr = &self.buf as *const u8;
-            let data_ptr = bytes_ptr.offset(mem::size_of::<PacketMetadata>() as isize) as *const u8;
-            Ok(slice::from_raw_parts(data_ptr, self.len - mem::size_of::<PacketMetadata>()))
-        }
-    }
-}
+    fn channels<'p>(&'p self) -> Result<Channels<'p>, MessageError> {
+        let offset = mem::size_of::<PacketHeader>();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn create_and_return_buffers() {
-        let pool = PacketBufferPool::new();
-        fn test(pool: &PacketBufferPool) {
-            let buf1 = pool.get_buf();
-            let buf2 = pool.get_buf();
-            let buf3 = pool.get_buf();
+        // Make sure we can read the number of channels
+        if self.len < offset + 1 {
+            return Err(MessageError::NotEnoughData);
         }
-        test(&pool);
-        assert_eq!(pool.len(), 3);
+        let num_channels = self.buf[offset];
+
+        // Make sure we can read all the channel sequence numbers
+        if self.len < offset + 1 + (num_channels as usize) * mem::size_of::<SeqNum>() {
+            return Err(MessageError::NotEnoughData);
+        }
+
+        // Reinterpret as u32 and create a slice
+        let seq_nums = unsafe {
+            let bytes_ptr = self.buf.as_ptr();
+            let seq_nums_ptr = bytes_ptr.offset((offset + 1) as isize) as *const u32;
+            slice::from_raw_parts(seq_nums_ptr, num_channels as usize)
+        };
+        Ok(Channels {
+            num_channels: self.buf[offset],
+            seq_nums: seq_nums,
+        })
     }
 }
