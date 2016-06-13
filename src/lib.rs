@@ -9,6 +9,9 @@ extern crate quick_error;
 extern crate byteorder;
 use byteorder::{NetworkEndian, ReadBytesExt};
 
+extern crate rand;
+use rand::Rng;
+
 /// Magic number used to help differentiate packets intended for a different protocol.
 const MAGIC_NUMBER: u32 = 412;
 
@@ -45,7 +48,8 @@ enum Event {
 
 /// The connection status of a peer.
 enum PeerState {
-    Connecting,
+    ConnectRequestReceived,
+    ConnectRequestSent,
     Connected,
 }
 
@@ -63,18 +67,22 @@ struct Peer {
     /// Packets that may or may not have been received by this peer.
     zombie_packets: Vec<Packet>,
 
-    /// The sync number for each channel.
-    channel_syns: Vec<u32>,
+    /// The next syn numbers expected from the peer.
+    peer_syns: Vec<u32>,
+
+    /// The next syn numbers expected from the host.
+    local_syns: Vec<u32>,
 }
 
 impl Peer {
-    fn new(addr: SocketAddr) -> Peer {
+    fn new(addr: SocketAddr, state: PeerState) -> Peer {
         Peer {
-            state: PeerState::Connecting,
+            state: state,
             addr: addr,
             outgoing_packets: Vec::new(),
             zombie_packets: Vec::new(),
-            channel_syns: Vec::new(),
+            peer_syns: Vec::new(),
+            local_syns: Vec::new(),
         }
     }
 
@@ -90,12 +98,72 @@ enum Message {
         num_channels: u8,
         syns: Vec<u32>,
     },
+    ConnectComplete,
     Data {
         syn: u32,
         channel: u8,
         data: Vec<u8>,
     },
     Disconnect,
+}
+
+impl Message {
+    /// Generates a connect handshake message.
+    ///
+    /// Can panic if num_channels is 0.
+    fn gen_connect_handshake(num_channels: u8) -> Message {
+        Message::ConnectHandshake {
+            num_channels: num_channels,
+            syns: gen_syns(num_channels),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum MessageKind {
+    ConnectStart,
+    ConnectHandshake,
+    ConnectComplete,
+    Data,
+    Disconnect,
+}
+
+impl MessageKind {
+    fn to_u8(self) -> u8 {
+        match self {
+            MessageKind::ConnectStart => 1,
+            MessageKind::ConnectHandshake => 2,
+            MessageKind::ConnectComplete => 3,
+            MessageKind::Data => 4,
+            MessageKind::Disconnect => 5,
+        }
+    }
+
+    fn from_u8(v: u8) -> Option<MessageKind> {
+        Some(match v {
+            1 => MessageKind::ConnectStart,
+            2 => MessageKind::ConnectHandshake,
+            3 => MessageKind::ConnectComplete,
+            4 => MessageKind::Data,
+            5 => MessageKind::Disconnect,
+            _ => return None,
+        })
+    }
+}
+
+/// Generates syn numbers.
+///
+/// Panics if num_channels is 0.
+fn gen_syns(num_channels: u8) -> Vec<u32> {
+    if num_channels == 0 {
+        panic!("Hosts must have at least 1 channel.");
+    }
+    let mut syns = Vec::with_capacity(num_channels);
+    let mut rng = rand::thread_rng();
+    for _ in 0..num_channels {
+        syns.push(rng.gen());
+    }
+    syns
 }
 
 struct Packet {
@@ -156,6 +224,37 @@ impl<S: Socket> Host<S> {
                 Ok(m) => m,
                 Err(_) => continue,
             };
+
+            match message {
+                Message::ConnectStart => {
+                    // If we already have the peer registered, then ignore this message
+                    if self.peers.contains_key(addr) {
+                        continue;
+                    }
+
+                    // Initialize a new peer
+                    let mut peer = Peer::new(addr, PeerState::ConnectRequestReceived);
+                    peer.local_syns.extend(gen_syns(self.num_channels).iter().cloned());
+
+                    // Setup an outgoing packet
+                    peer.outgoing_packets.push(Packet {
+                        addr: addr,
+                        kind: Message::ConnectHandshake {
+                            num_channels: self.num_channels,
+                            syns: peer.local_syns.clone(),
+                        },
+                    });
+                }
+                Message::ConnectHandshake => {
+                    // Ignore unknown peers
+                    let mut peer = match self.peers.get_mut(addr) {
+                        Some(peer) => peer,
+                        None => continue,
+                    };
+
+                    // Ignore unexpected handshakes
+                }
+            }
         }
         Ok(())
     }
@@ -168,13 +267,17 @@ impl<S: Socket> Host<S> {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Magic number does not match."));
         }
 
-        // Get the message type
-        let msg = match try!(cursor.read_u32::<NetworkEndian>()) {
-            // A "Start Connection" message
-            1 => Message::ConnectStart,
+        // Get the message kind
+        let msg_kind = match MessageKind::from_u8(try!(cursor.read_u32::<NetworkEndian>())) {
+            Some(kind) => kind,
+            None => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput("Unknown message type.")))
+            }
+        };
+        let msg = match msg_kind {
+            MessageKind::ConnectStart => Message::ConnectStart,
 
-            // A "ConnectHandshake" message
-            2 => {
+            MessageKind::ConnectHandshake => {
                 let num_channels = try!(cursor.read_u8());
                 if num_channels == 0 {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput,
@@ -191,8 +294,7 @@ impl<S: Socket> Host<S> {
                 }
             }
 
-            // A "Data" message
-            3 => {
+            MessageKind::Data => {
                 let syn = try!(cursor.read_u32::<NetworkEndian>());
                 let channel = try!(cursor.read_u8());
                 let mut data = Vec::new();
@@ -204,8 +306,9 @@ impl<S: Socket> Host<S> {
                 }
             }
 
-            // A "Disconnect" message
-            4 => Message::Disconnect,
+            MessageKind::Disconnect => Message::Disconnect,
+
+            MessageKind::ConnectComplete => Message::ConnectComplete,
 
             _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid message type.")),
         };
