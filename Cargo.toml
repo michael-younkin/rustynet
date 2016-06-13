@@ -5,3 +5,4 @@ authors = ["michael"]
 
 [dependencies]
 quick-error = "1.1.0"
+byteorder = "0.5.3"
